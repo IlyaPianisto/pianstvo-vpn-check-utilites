@@ -3,11 +3,12 @@ import base64
 import binascii
 import json
 import os
-import httpx
-import uuid
 import random
 import re
+import uuid
 from pathlib import Path
+
+import httpx
 from dotenv import load_dotenv
 
 ENV_PATH = Path(".env")
@@ -22,7 +23,9 @@ WIN_BUILDS = (
     "10.0.26200",
 )
 
+
 def init_config():
+    """Создаёт .env со случайными параметрами устройства при первом запуске и загружает его."""
     if not ENV_PATH.exists():
         hwid = str(uuid.uuid4())
         ua_id = random.randint(10**12, 10**13 - 1)
@@ -41,6 +44,7 @@ DEVICE_MODEL=Desktop
 
     load_dotenv(ENV_PATH)
 
+
 init_config()
 
 PROXY = "socks5://127.0.0.1:10808"
@@ -54,6 +58,7 @@ OUTPUT_DIR = "configs"
 JSON_OUTPUT = "vpn_config.json"
 TEXT_OUTPUT = "vpn_links.txt"
 
+
 def try_decode_base64(text: str):
     """Возвращает расшифрованный текст или None, если это не Base64."""
     compact = "".join(text.split())
@@ -63,6 +68,7 @@ def try_decode_base64(text: str):
         return base64.b64decode(normalized, validate=True).decode("utf-8")
     except (binascii.Error, UnicodeDecodeError, ValueError):
         return None
+
 
 def extract_profile_title(raw_title: str | None) -> str | None:
     """Декодирует profile-title (включая base64:...) и чистит под безопасное имя файла."""
@@ -81,8 +87,9 @@ def extract_profile_title(raw_title: str | None) -> str | None:
 
     return clean or None
 
+
 def parse_content(raw_text: str) -> dict:
-    """Определяет формат ответа: JSON (sing-box / generic) или список ссылок."""
+    """Определяет формат ответа: JSON (xray / sing-box / generic) или список ссылок."""
     decoded = try_decode_base64(raw_text)
     was_base64 = decoded is not None
     if was_base64:
@@ -116,7 +123,9 @@ def parse_content(raw_text: str) -> dict:
     print(f"Найдено строк/ключей: {len(lines)}")
     return {"type": "raw_lines", "lines": lines, "was_base64": was_base64}
 
+
 async def fetch_and_parse_subscription(url: str):
+    """Запрашивает подписку (сначала через прокси, при ошибке — напрямую) и парсит ответ."""
     headers = {
         "User-Agent": USER_AGENT,
         "x-hwid": HWID,
@@ -126,24 +135,45 @@ async def fetch_and_parse_subscription(url: str):
         "Accept": "application/json, text/plain, */*",
     }
 
+    attempts = []
+    if PROXY:
+        attempts.append((f"через прокси ({PROXY})", PROXY))
+    attempts.append(("напрямую (без прокси)", None))
+
     print("\nСтучимся по ссылке подписки с эмуляцией клиента...")
 
-    try:
-        async with httpx.AsyncClient(proxy=PROXY, timeout=15.0, follow_redirects=True) as client:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            raw_text = response.text.strip()
+    timeout = httpx.Timeout(15.0, connect=5.0)
 
-            print(f"Статус: {response.status_code}. Получено символов: {len(raw_text)}.")
-            for name in ("profile-title", "subscription-userinfo", "content-type"):
-                if name in response.headers:
-                    print(f"    {name}: {response.headers[name]}")
+    for mode_label, proxy_url in attempts:
+        print(f"Попытка подключения {mode_label}...")
+        try:
+            async with httpx.AsyncClient(
+                proxy=proxy_url,
+                timeout=timeout,
+                follow_redirects=True,
+                trust_env=False,
+            ) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                raw_text = response.text.strip()
 
-            return parse_content(raw_text)
+                print(f"Успешно ({mode_label})! Статус: {response.status_code}. Получено символов: {len(raw_text)}.")
+                for name in ("profile-title", "subscription-userinfo", "content-type"):
+                    if name in response.headers:
+                        print(f"    {name}: {response.headers[name]}")
 
-    except Exception as e:
-        print(f"ERROR: ошибка при запросе подписки: {e}")
-        return None
+                result = parse_content(raw_text)
+                result["profile_title"] = extract_profile_title(response.headers.get("profile-title"))
+                return result
+
+        except Exception as e:
+            if proxy_url is not None:
+                print(f"Не удалось через прокси ({type(e).__name__}: {e}). Переключаемся на прямое подключение...")
+            else:
+                print(f"ERROR: ошибка при прямом запросе подписки: {e}")
+
+    return None
+
 
 def unique_path(path: str) -> str:
     """Если файл уже есть, добавляет -2, -3 и т.д. перед расширением."""
@@ -155,22 +185,29 @@ def unique_path(path: str) -> str:
         n += 1
     return f"{base}-{n}{ext}"
 
+
 def save_result(result: dict) -> str:
     """JSON сохраняем в .json, всё остальное в .txt. Существующие файлы не перезаписываем."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+    title = result.get("profile_title")
+
     if result["type"].startswith("json"):
-        filename = unique_path(os.path.join(OUTPUT_DIR, JSON_OUTPUT))
+        base_name = f"{title}_config.json" if title else JSON_OUTPUT
+        filename = unique_path(os.path.join(OUTPUT_DIR, base_name))
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(result["data"], f, indent=2, ensure_ascii=False)
         return filename
 
-    filename = unique_path(os.path.join(OUTPUT_DIR, TEXT_OUTPUT))
+    base_name = f"{title}_links.txt" if title else TEXT_OUTPUT
+    filename = unique_path(os.path.join(OUTPUT_DIR, base_name))
     with open(filename, "w", encoding="utf-8") as f:
         f.write("\n".join(result["lines"]) + "\n")
     return filename
 
+
 async def main():
+    print("=== Парсер конфигураций XRAY-JSON ===")
     test_url = input("Введи ссылку на подписку: ").strip()
     if not test_url:
         print("Ссылка не введена!")
@@ -189,6 +226,7 @@ async def main():
         source = "Base64" if result["was_base64"] else "обычный текст"
         print(f"Список ссылок ({len(result['lines'])} шт., источник: {source}) сохранён в файл: {filename}")
     print("=" * 80)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

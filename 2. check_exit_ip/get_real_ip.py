@@ -1,17 +1,3 @@
-"""
-Объединённый скрипт проверки выходных IP-адресов VPN-конфигов через Xray (SOCKS5).
-
-Поддерживаемые методы проверки:
-  1 — 2ip.io    (https://api.2ip.io/?token=..., требует бесплатный API-токен в .env)
-  2 — ipinfo.io (https://ipinfo.io/json)
-  3 — myip.com  (https://api.myip.com)
-
-Результаты сохраняются в папку check_result/ в формате CSV:
-  check_result/{имя_конфига}-exit-{метод}.csv
-
-Внешние библиотеки (pip) не требуются — используется только стандартная библиотека Python.
-"""
-
 import csv
 import ipaddress
 import json
@@ -21,12 +7,14 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from collections import Counter
 from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_XRAY = r"\xray\xray.exe"
-SOCKS_PORT = 10808
+PROXY_PORT = 10808
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(SCRIPT_DIR, ".env")
 RESULT_DIR = os.path.join(SCRIPT_DIR, "check_result")
@@ -38,14 +26,10 @@ _dns_cache: Dict[str, str] = {}
 
 
 def log(msg: str = "") -> None:
-    """Печатает строку с мгновенным сбросом буфера."""
     print(msg, flush=True)
 
+
 def load_dotenv(path: str) -> None:
-    """
-    Загружает переменные из .env в os.environ.
-    Уже заданные в системе переменные окружения не перезаписываются.
-    """
     if not os.path.isfile(path):
         return
     try:
@@ -66,9 +50,6 @@ def load_dotenv(path: str) -> None:
 
 
 def save_env_var(path: str, key: str, value: str) -> None:
-    """
-    Применяет переменную в текущем процессе (os.environ) и сохраняет/обновляет её в .env.
-    """
     os.environ[key] = value
 
     lines: List[str] = []
@@ -102,11 +83,6 @@ def save_env_var(path: str, key: str, value: str) -> None:
 
 
 def ensure_twoip_token() -> str:
-    """
-    Проверяет наличие TWOIP_TOKEN в окружении / .env.
-    Если ключа нет — выводит инструкцию по получению, запрашивает его у пользователя,
-    применяет в os.environ и сохраняет в .env.
-    """
     token = os.environ.get("TWOIP_TOKEN", "").strip()
     if token:
         return token
@@ -131,11 +107,7 @@ def ensure_twoip_token() -> str:
 
 
 def clean_path_input(raw: str) -> str:
-    """
-    Очищает путь, введённый или перетащенный мышкой в консоль Windows (CMD / PowerShell).
-    """
     p = raw.strip()
-    # В PowerShell при перетаскивании файла иногда подставляется префикс "& 'путь'"
     if p.startswith("& "):
         p = p[2:].strip()
     if len(p) >= 2 and p[0] == p[-1] and p[0] in ('"', "'"):
@@ -144,10 +116,6 @@ def clean_path_input(raw: str) -> str:
 
 
 def ensure_xray_path() -> str:
-    """
-    Ищет xray.exe по переменной XRAY_PATH, дефолтному пути или рядом со скриптом.
-    Если не найден — запрашивает путь у пользователя и сохраняет в .env.
-    """
     candidates = [
         os.environ.get("XRAY_PATH", "").strip(),
         DEFAULT_XRAY,
@@ -170,8 +138,8 @@ def ensure_xray_path() -> str:
             return p
         log(f"Файл не найден: {p}")
 
+
 def prompt_json_path() -> str:
-    """Запрашивает у пользователя путь к JSON-файлу с конфигами."""
     while True:
         raw = input("Введите путь к JSON-файлу конфига: ")
         path = clean_path_input(raw)
@@ -185,14 +153,10 @@ def prompt_json_path() -> str:
 
 
 def prompt_method() -> str:
-    """
-    Запрашивает метод проверки и возвращает внутренний код метода:
-    '2ip', 'ipinfo' или 'myip'.
-    """
     log("\nВыберите метод проверки:")
-    log("  1 - 2ip.io    (полные данные + ссылка whois, нужен бесплатный API-ключ)")
-    log("  2 - ipinfo.io (проверка IP, страны и ASN (менее подробно))")
-    log("  3 - myip.com (дополнительный способ. функционал как у [2])")
+    log("  1 - 2ip.io     (полные данные + ссылка whois, нужен бесплатный API-ключ)")
+    log("  2 - ipinfo.io  (проверка IP, страны и ASN (менее подробно))")
+    log("  3 - ip-api.com (дополнительный способ. тоже самое, что и [2])")
 
     mapping = {
         "1": "2ip",
@@ -201,10 +165,10 @@ def prompt_method() -> str:
         "2": "ipinfo",
         "ipinfo": "ipinfo",
         "ipinfo.io": "ipinfo",
-        "ipconfig": "ipinfo",  # на случай привычного ввода
-        "3": "myip",
-        "myip": "myip",
-        "myip.com": "myip",
+        "ipconfig": "ipinfo",
+        "3": "ip-api",
+        "ip-api": "ip-api",
+        "ip-api.com": "ip-api",
     }
 
     while True:
@@ -213,8 +177,8 @@ def prompt_method() -> str:
             return mapping[choice]
         log("Неверный выбор. Введите 1, 2 или 3.")
 
+
 def resolve_entry(addr: str) -> str:
-    """IP возвращает как есть, домен резолвит в строку 'домен (ip1, ip2)'."""
     try:
         ipaddress.ip_address(addr)
         return addr
@@ -232,7 +196,6 @@ def resolve_entry(addr: str) -> str:
 
 
 def get_entry(cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[Any], Optional[str], Optional[str]]:
-    """Извлекает из первого прокси-outbound: (адрес, порт, протокол, транспорт)."""
     for o in cfg.get("outbounds", []):
         if o.get("protocol") in ("freedom", "blackhole", "dns"):
             continue
@@ -256,7 +219,6 @@ def get_entry(cfg: Dict[str, Any]) -> Tuple[Optional[str], Optional[Any], Option
 
 
 def wait_port(port: int, proc: subprocess.Popen, timeout: float = 6.0) -> bool:
-    """Ожидает, пока Xray откроет локальный SOCKS5-порт."""
     end = time.time() + timeout
     while time.time() < end:
         if proc.poll() is not None:
@@ -268,95 +230,54 @@ def wait_port(port: int, proc: subprocess.Popen, timeout: float = 6.0) -> bool:
             time.sleep(0.1)
     return False
 
+
 def build_api_url(method: str, twoip_token: str = "") -> str:
-    """Формирует URL запроса для выбранного метода."""
     if method == "2ip":
         template = os.environ.get("TWOIP_URL", "https://api.2ip.io/?token={token}")
         return template.format(token=urllib.parse.quote(twoip_token))
     if method == "ipinfo":
         return "https://ipinfo.io/json"
-    if method == "myip":
-        return "https://api.myip.com/"
+    if method == "ip-api":
+        return "http://ip-api.com/json/?fields=status,message,country,countryCode,city,isp,org,as,hosting,query"
     raise ValueError(f"Неизвестный метод: {method}")
 
 
-def fetch_via_socks(
-                        url: str,
-                        port: int,
-                        force_ipv4: bool = False,
-                                                    ) -> Tuple[Optional[Dict[str, Any]], Optional[float], int, str]:
-    """
-    Выполняет HTTPS-запрос через локальный SOCKS5-прокси с помощью curl.exe.
-    При force_ipv4=False используется socks5h:// (DNS на стороне VPN-сервера).
-    При force_ipv4=True домен резолвится в IPv4 (-4) и передаётся через socks5://,
-    что обходит сломанный IPv6 на VPS (актуально для Cloudflare / api.myip.com).
+def fetch_via_proxy(url: str, port: int) -> Tuple[Optional[Dict[str, Any]], Optional[float], int, str]:
+    proxy_url = f"http://127.0.0.1:{port}"
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        },
+    )
 
-    Возвращает кортеж: (json_dict | None, время_в_сек | None, http_code, текст_ошибки).
-    """
-    proxy_scheme = "socks5" if force_ipv4 else "socks5h"
-    cmd = [
-        "curl.exe",
-        "-sS",
-        "-L",
-        "--http1.1",
-        "--ssl-no-revoke",
-        "--connect-timeout", "7",
-        "--max-time", "10",
-        "--proxy", f"{proxy_scheme}://127.0.0.1:{port}",
-        "-A", (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-        ),
-        "-H", "Accept: application/json",
-        "-w", "\n%{http_code}\n%{time_total}",
-    ]
-    if force_ipv4:
-        cmd.append("-4")
-    cmd.append(url)
-
+    t0 = time.perf_counter()
     try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError:
-        return None, None, 0, "curl.exe не найден в системе"
+        with opener.open(req, timeout=10) as resp:
+            http_code = resp.getcode() or 200
+            body = resp.read().decode("utf-8", errors="replace")
+            elapsed = round(time.perf_counter() - t0, 2)
+    except urllib.error.HTTPError as e:
+        elapsed = round(time.perf_counter() - t0, 2)
+        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        preview = body.strip().replace("\n", " ")[:120]
+        return None, elapsed, e.code, f"HTTP {e.code}: {preview}"
+    except urllib.error.URLError as e:
+        elapsed = round(time.perf_counter() - t0, 2)
+        return None, elapsed, 0, str(e.reason)
     except Exception as e:
-        return None, None, 0, f"{type(e).__name__}: {e}"
-
-    stdout = res.stdout or ""
-    parts = stdout.rsplit("\n", 2)
-    if len(parts) != 3:
-        err = (res.stderr or "").strip() or "пустой ответ"
-        return None, None, 0, err
-
-    body, code_str, time_str = parts
-    try:
-        http_code = int(code_str.strip())
-    except ValueError:
-        http_code = 0
-
-    try:
-        elapsed = round(float(time_str.strip().replace(",", ".")), 2)
-    except ValueError:
-        elapsed = None
-
-    if http_code == 0:
-        err = (res.stderr or "").strip() or "нет соединения"
-        return None, elapsed, 0, err
+        elapsed = round(time.perf_counter() - t0, 2)
+        return None, elapsed, 0, f"{type(e).__name__}: {e}"
 
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
         preview = body.strip().replace("\n", " ")[:120]
         return None, elapsed, http_code, f"HTTP {http_code}, не JSON: {preview}"
-
-    if http_code >= 400:
-        preview = body.strip().replace("\n", " ")[:120]
-        return data if isinstance(data, dict) else None, elapsed, http_code, f"HTTP {http_code}: {preview}"
 
     if not isinstance(data, dict):
         return None, elapsed, http_code, "ожидался JSON-объект"
@@ -365,10 +286,6 @@ def fetch_via_socks(
 
 
 def parse_api_response(method: str, data: Dict[str, Any]) -> Tuple[str, str, str, str]:
-    """
-    Нормализует ответ любого из 3 сервисов в единый набор полей:
-      (exit_ip, country, city, org)
-    """
     if method == "2ip":
         exit_ip = str(data.get("ip") or "").strip()
 
@@ -407,20 +324,30 @@ def parse_api_response(method: str, data: Dict[str, Any]) -> Tuple[str, str, str
         org = str(data.get("org") or "").strip()
         return exit_ip, country, city, org
 
-    if method == "myip":
-        exit_ip = str(data.get("ip") or "").strip()
-        cc = str(data.get("cc") or "").strip()
+    if method == "ip-api":
+        if data.get("status") == "fail":
+            return "", "", "", ""
+        exit_ip = str(data.get("query") or "").strip()
+        code = str(data.get("countryCode") or "").strip()
         country_name = str(data.get("country") or "").strip()
-        if cc and country_name and cc.upper() != country_name.upper():
-            country = f"{cc} ({country_name})"
+        if code and country_name and code.upper() != country_name.upper():
+            country = f"{code} ({country_name})"
         else:
-            country = cc or country_name
-        return exit_ip, country, "", ""
+            country = code or country_name
+        city = str(data.get("city") or "").strip()
+        org_parts: List[str] = []
+        as_info = str(data.get("as") or data.get("org") or data.get("isp") or "").strip()
+        if as_info:
+            org_parts.append(as_info)
+        if data.get("hosting") is True:
+            org_parts.append("[hosting]")
+        org = " ".join(org_parts)
+        return exit_ip, country, city, org
 
     return "", "", "", ""
 
+
 def save_results_csv(out_path: str, fieldnames: List[str], rows: List[Dict[str, Any]]) -> None:
-    """Сохраняет собранную таблицу в CSV (UTF-8 с BOM для корректного открытия в Excel)."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -474,13 +401,12 @@ def main() -> None:
         ]
 
     log()
-    log(f"Конфигов: {total} | Метод: {method} | SOCKS5 порт: {SOCKS_PORT}")
+    log(f"Конфигов: {total} | Метод: {method} | Прокси порт: {PROXY_PORT}")
     log(f"Результат будет сохранён в: {out_path}\n")
 
     rows: List[Dict[str, Any]] = []
     auth_errors = 0
     interrupted = False
-    prefer_ipv4 = False
 
     try:
         for i, orig_cfg in enumerate(configs):
@@ -496,11 +422,11 @@ def main() -> None:
             log(f"    вход: {entry}:{port}  {proto} {transport}")
 
             cfg["inbounds"] = [{
-                "tag": "socks",
-                "port": SOCKS_PORT,
+                "tag": "http",
+                "port": PROXY_PORT,
                 "listen": "127.0.0.1",
-                "protocol": "socks",
-                "settings": {"udp": True, "auth": "noauth"},
+                "protocol": "http",
+                "settings": {},
             }]
 
             cfg_path = os.path.join(tempfile.gettempdir(), f"xray_chk_{os.getpid()}_{i}.json")
@@ -522,7 +448,7 @@ def main() -> None:
                         stderr=subprocess.STDOUT,
                     )
 
-                if not wait_port(SOCKS_PORT, proc):
+                if not wait_port(PROXY_PORT, proc):
                     status = "XRAY FAIL"
                     try:
                         with open(log_path, "r", encoding="utf-8", errors="replace") as lf:
@@ -532,41 +458,30 @@ def main() -> None:
                     log("    ✗ xray не стартовал: " + " | ".join(tail))
 
                 else:
-                    data = None
                     last_err = ""
                     last_code = 0
-                    used_ipv4 = prefer_ipv4
-
-                    # Попытка 1 — текущий предпочтительный режим;
-                    # Попытка 2 — альтернативный (переключение между socks5h и IPv4 socks5)
-                    attempts_plan = [prefer_ipv4, not prefer_ipv4]
-                    for attempt, use_ipv4 in enumerate(attempts_plan, 1):
-                        data, sec_val, last_code, last_err = fetch_via_socks(
-                            api_url, SOCKS_PORT, force_ipv4=use_ipv4
-                        )
-                        if data and data.get("ip") and last_code < 400:
-                            sec = sec_val if sec_val is not None else ""
-                            auth_errors = 0
-                            used_ipv4 = use_ipv4
-                            if attempt == 2 and use_ipv4:
-                                prefer_ipv4 = True
-                            break
+                    for attempt in (1, 2):
+                        data, sec_val, last_code, last_err = fetch_via_proxy(api_url, PROXY_PORT)
+                        if data and last_code < 400:
+                            exit_ip, country, city, org = parse_api_response(method, data)
+                            if exit_ip:
+                                sec = sec_val if sec_val is not None else ""
+                                auth_errors = 0
+                                break
+                            last_err = str(data.get("message") or "нет IP в ответе")
 
                         if last_code in (401, 403):
                             auth_errors += 1
                             break
 
-                        mode_tag = "IPv4" if use_ipv4 else "socks5h"
-                        log(f"    … попытка {attempt} [{mode_tag}] неудачна ({last_err or 'нет IP в ответе'})")
+                        log(f"    … попытка {attempt} неудачна ({last_err or 'нет ответа'})")
 
-                    if data and data.get("ip") and last_code < 400:
-                        exit_ip, country, city, org = parse_api_response(method, data)
+                    if exit_ip:
                         extra_info = "  ".join(part for part in (
                             f"{country}/{city}" if city else country,
                             org,
                         ) if part)
-                        ipv4_note = " [IPv4]" if used_ipv4 else ""
-                        log(f"    ✓ выход: {exit_ip}  {extra_info}  ({sec} с){ipv4_note}")
+                        log(f"    ✓ выход: {exit_ip}  {extra_info}  ({sec} с)")
                     else:
                         status = f"HTTP {last_code}" if last_code >= 400 else "NO RESPONSE"
                         log(f"    ✗ ошибка запроса: {last_err or 'нет ответа через прокси'}")
