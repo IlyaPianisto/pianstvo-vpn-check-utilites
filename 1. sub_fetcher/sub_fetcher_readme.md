@@ -4,6 +4,9 @@
 
 ---
 
+Если подписка зашифрована (например happ://crypt4), можно воспользоваться/скачать [happ-decryptor (ссылка на GitHub на том же сайте)](https://leeeet.dev/happ-decryptor/)
+
+---
 ## Что умеет
 
 - Эмулирует клиентское приложение заголовками `User-Agent`, `x-hwid`, `x-device-os`, `x-ver-os`, `x-device-model`.
